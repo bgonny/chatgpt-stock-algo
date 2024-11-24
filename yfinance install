@@ -1,0 +1,4 @@
+
+#this allows us to install yfinance on the terminal in VSC
+
+py -m pip install yfinance
