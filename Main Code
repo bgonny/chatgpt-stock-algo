@@ -1,0 +1,426 @@
+# File: stock_trading_algo_fixed.py
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+# Switch to Agg backend instead of TkAgg
+plt.switch_backend('Agg')
+
+def calculate_vwap(data):
+    """Calculate VWAP"""
+    df = data.copy()
+    df['Typical_Price'] = (df['High'] + df['Low'] + df['Adj Close']) / 3
+    df['VP'] = df['Typical_Price'] * df['Volume']
+    df['CV'] = df['Volume'].cumsum()
+    df['VWAP'] = df['VP'].cumsum() / df['CV']
+    return df['VWAP']
+
+def calculate_indicators(data):
+    """Calculate all technical indicators including VWAP"""
+    try:
+        df = pd.DataFrame()
+        ticker = data.columns.get_level_values(1)[0]
+        
+        # Basic price data
+        df['Adj Close'] = data[('Adj Close', ticker)]
+        df['High'] = data[('High', ticker)]
+        df['Low'] = data[('Low', ticker)]
+        df['Volume'] = data[('Volume', ticker)]
+        
+        # Calculate VWAP
+        df['VWAP'] = calculate_vwap(df)
+        
+        # Moving Averages
+        df['Short_MA'] = df['Adj Close'].rolling(window=20).mean()
+        df['Long_MA'] = df['Adj Close'].rolling(window=50).mean()
+        
+        # MACD
+        exp1 = df['Adj Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Adj Close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp1 - exp2
+        df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # RSI
+        delta = df['Adj Close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # Volatility
+        df['Returns'] = df['Adj Close'].pct_change()
+        df['Volatility'] = df['Returns'].rolling(window=20).std()
+        
+        return df.dropna()
+        
+    except Exception as e:
+        print(f"Error in calculate_indicators: {str(e)}")
+        return None
+
+def generate_signals(data, params):
+    """Generate trading signals with more balanced conditions"""
+    try:
+        df = data.copy()
+        df['Signal'] = 0
+        
+        # Entry conditions - using proper boolean operations
+        trend_condition = (
+            (df['Short_MA'] > df['Long_MA']) &  # Uptrend
+            (df['Adj Close'] > df['VWAP'])      # Price above VWAP
+        )
+        
+        momentum_condition = (
+            ((df['MACD'] > df['Signal_Line']) |  # MACD condition
+            ((df['RSI'] > 40) & (df['RSI'] < 65)))  # RSI condition
+        )
+        
+        volatility_condition = (
+            df['Volatility'] < (params['vol_threshold'] * 1.5)  # Volatility threshold
+        )
+        
+        # Combined entry conditions (need 2 out of 3)
+        entry_conditions = (
+            ((trend_condition) & (momentum_condition)) |
+            ((trend_condition) & (volatility_condition)) |
+            ((momentum_condition) & (volatility_condition))
+        )
+        
+        # Set entry signals
+        df.loc[entry_conditions, 'Signal'] = 1
+        
+        # Exit conditions
+        price_exits = (
+            (df['Returns'] <= -params['stop_loss']) |
+            (df['Returns'] >= params['take_profit'])
+        )
+        
+        trend_exits = (
+            (df['Short_MA'] < df['Long_MA']) &
+            (df['Adj Close'] < df['VWAP'])
+        )
+        
+        momentum_exits = (
+            (df['RSI'] > 75) |
+            ((df['MACD'] < df['Signal_Line']) & (df['RSI'] < 35))
+        )
+        
+        # Combine all exit conditions
+        exit_conditions = (
+            price_exits |
+            trend_exits |
+            momentum_exits
+        )
+        
+        # Apply exits to existing positions
+        df.loc[exit_conditions & (df['Signal'].shift(1) == 1), 'Signal'] = 0
+        
+        # Prevent rapid re-entry
+        no_reentry_mask = df['Signal'].shift(1) == 0
+        df.loc[no_reentry_mask, 'Signal'] = 0
+        
+        # Calculate positions and returns
+        df['Position'] = df['Signal'].shift(1).fillna(0)
+        df['Strategy_Returns'] = df['Returns'] * df['Position']
+        
+        # Print signal statistics
+        total_signals = len(df[df['Signal'] == 1])
+        print(f"Total entry signals generated: {total_signals}")
+        
+        if total_signals > 0:
+            signal_days = df[df['Signal'] == 1].index
+            avg_hold_time = (signal_days[-1] - signal_days[0]).days / total_signals
+            print(f"Average holding period: {avg_hold_time:.1f} days")
+        
+        return df
+        
+    except Exception as e:
+        print(f"Error in generate_signals: {str(e)}")
+        return None
+
+def plot_strategy_results(df, ticker):
+    """Plot strategy results including VWAP"""
+    try:
+        # Create plots directory
+        plots_dir = "strategy_plots"
+        if not os.path.exists(plots_dir):
+            os.makedirs(plots_dir)
+        
+        # Create figure and subplots
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12))
+        fig.suptitle(f'Trading Strategy Results - {ticker} (2020-2023)', fontsize=14)
+        
+        # Plot 1: Price, MAs, and VWAP
+        ax1.plot(df.index, df['Adj Close'], label='Price', color='blue', alpha=0.7)
+        ax1.plot(df.index, df['Short_MA'], label='20 MA', color='orange', alpha=0.7)
+        ax1.plot(df.index, df['Long_MA'], label='50 MA', color='red', alpha=0.7)
+        ax1.plot(df.index, df['VWAP'], label='VWAP', color='purple', alpha=0.7)
+        
+        # Add signals
+        buys = df[df['Signal'] == 1]
+        ax1.scatter(buys.index, buys['Adj Close'], 
+                   marker='^', color='green', s=100, label='Buy Signal')
+        
+        sells = df[df['Signal'] == 0]
+        ax1.scatter(sells.index, sells['Adj Close'],
+                   marker='v', color='red', s=100, label='Sell Signal')
+        
+        ax1.set_title('Price Action and Signals')
+        ax1.set_ylabel('Price ($)')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # Plot 2: Technical Indicators
+        ax2.plot(df.index, df['RSI'], label='RSI', color='purple')
+        ax2.plot(df.index, df['MACD'], label='MACD', color='blue', alpha=0.7)
+        ax2.plot(df.index, df['Signal_Line'], label='Signal Line', color='red', alpha=0.7)
+        
+        # Add RSI levels
+        ax2.axhline(y=70, color='r', linestyle='--', alpha=0.5)
+        ax2.axhline(y=30, color='g', linestyle='--', alpha=0.5)
+        ax2.set_title('Technical Indicators')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # Plot 3: Strategy Performance
+        if 'Strategy_Returns' in df.columns:
+            cumulative_returns = (1 + df['Strategy_Returns']).cumprod()
+            ax3.plot(df.index, cumulative_returns, label='Strategy Returns', 
+                    color='green', linewidth=2)
+            ax3.axhline(y=1, color='black', linestyle='--', alpha=0.5)
+            ax3.set_title('Cumulative Returns')
+            ax3.set_ylabel('Return Multiple')
+            ax3.grid(True, alpha=0.3)
+            ax3.legend()
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Save plot
+        save_path = os.path.join(plots_dir, f'strategy_results_{ticker}.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Plot saved at: {os.path.abspath(save_path)}")
+        
+    except Exception as e:
+        print(f"Error in plotting for {ticker}: {str(e)}")
+
+def backtest_strategy(df):
+    """Run backtest and calculate performance metrics"""
+    try:
+        # Calculate daily strategy returns
+        df['Strategy_Returns'] = df['Returns'] * df['Position']
+        
+        # Calculate cumulative returns
+        cumulative_returns = (1 + df['Strategy_Returns']).cumprod() - 1
+        
+        # Calculate key metrics
+        total_return = cumulative_returns.iloc[-1]
+        n_years = len(df) / 252  # Trading days in a year
+        annual_return = (1 + total_return) ** (1 / n_years) - 1
+        
+        # Risk metrics
+        daily_std = df['Strategy_Returns'].std()
+        annualized_vol = daily_std * np.sqrt(252)
+        sharpe_ratio = (annual_return - 0.02) / annualized_vol  # Assuming 2% risk-free rate
+        
+        # Maximum drawdown
+        rolling_max = cumulative_returns.expanding().max()
+        drawdowns = cumulative_returns - rolling_max
+        max_drawdown = drawdowns.min()
+        
+        # Trade statistics
+        total_trades = len(df[df['Signal'] == 1])
+        winning_trades = len(df[df['Strategy_Returns'] > 0])
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        # Create results dictionary
+        results = {
+            'Total Return': total_return,
+            'Annual Return': annual_return,
+            'Volatility': annualized_vol,
+            'Sharpe Ratio': sharpe_ratio,
+            'Max Drawdown': max_drawdown,
+            'Total Trades': total_trades,
+            'Win Rate': win_rate,
+            'Avg Holding Period': len(df[df['Position'] == 1]) / total_trades if total_trades > 0 else 0
+        }
+        
+        # Print results
+        print(f"\nBacktest Results:")
+        print("-" * 40)
+        print(f"Total Return: {results['Total Return']:.2%}")
+        print(f"Annual Return: {results['Annual Return']:.2%}")
+        print(f"Volatility: {results['Volatility']:.2%}")
+        print(f"Sharpe Ratio: {results['Sharpe Ratio']:.2f}")
+        print(f"Max Drawdown: {results['Max Drawdown']:.2%}")
+        print(f"Total Trades: {results['Total Trades']}")
+        print(f"Win Rate: {results['Win Rate']:.2%}")
+        print(f"Avg Holding Period: {results['Avg Holding Period']:.1f} days")
+        
+        # Add cumulative returns to results
+        results['cumulative_returns'] = (1 + df['Strategy_Returns']).cumprod()
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error in backtest: {str(e)}")
+        return None
+
+def process_ticker(ticker, params):
+    """Process single ticker with full analysis"""
+    try:
+        print(f"\nProcessing {ticker}...")
+        
+        # Download data
+        data = yf.download(ticker, start='2015-01-01', end='2023-12-31', progress=False)
+        
+        # Calculate indicators
+        df = calculate_indicators(data)
+        if df is None:
+            return
+        
+        # Generate signals
+        df = generate_signals(df, params)
+        if df is None:
+            return
+        
+        # Run backtest
+        results = backtest_strategy(df)
+        if results is None:
+            return
+            
+        # Plot results
+        plot_strategy_results(df, ticker)
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error processing {ticker}: {str(e)}")
+        return None
+
+def plot_strategy_benchmark_comparison(all_results, tickers):
+    """Create a comparative performance plot including S&P 500 benchmark"""
+    try:
+        # Download S&P 500 data
+        spy = yf.download('^GSPC', start='2020-01-01', end='2023-12-31', progress=False)
+        spy_returns = spy['Adj Close'].pct_change()
+        spy_cum_returns = (1 + spy_returns).cumprod()
+        
+        # Create figure
+        plt.figure(figsize=(15, 8))
+        
+        # Plot S&P 500 benchmark
+        plt.plot(spy_cum_returns.index, spy_cum_returns, 
+                label='S&P 500', color='black', linewidth=2, alpha=0.7)
+        
+        # Plot each ticker's cumulative returns
+        colors = ['blue', 'green', 'red', 'purple', 'orange', 'brown']
+        for i, ticker in enumerate(tickers):
+            if ticker in all_results:
+                df = all_results[ticker]['cumulative_returns']
+                plt.plot(df.index, df, 
+                        label=ticker, 
+                        color=colors[i % len(colors)], 
+                        alpha=0.7)
+        
+        # Calculate and plot strategy average
+        all_returns = pd.DataFrame({ticker: all_results[ticker]['cumulative_returns'] 
+                                  for ticker in all_results})
+        avg_returns = all_returns.mean(axis=1)
+        plt.plot(avg_returns.index, avg_returns, 
+                label='Strategy Average', 
+                color='cyan', 
+                linewidth=3, 
+                linestyle='--')
+        
+        # Customize plot
+        plt.title('Strategy Performance vs S&P 500 (2020-2023)', fontsize=14)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Cumulative Returns', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # Add performance statistics
+        stats_text = "Performance Statistics:\n"
+        stats_text += f"S&P 500 Return: {(spy_cum_returns.iloc[-1]-1):.2%}\n"
+        stats_text += f"Strategy Avg Return: {(avg_returns.iloc[-1]-1):.2%}\n"
+        
+        # Add individual ticker returns
+        for ticker in tickers:
+            if ticker in all_results:
+                final_return = all_results[ticker]['cumulative_returns'].iloc[-1] - 1
+                stats_text += f"{ticker} Return: {final_return:.2%}\n"
+        
+        plt.figtext(1.15, 0.5, stats_text, fontsize=10, va='center')
+        
+        # Adjust layout and save
+        plt.tight_layout()
+        plt.savefig('strategy_benchmark_comparison.png', 
+                   bbox_inches='tight', 
+                   dpi=300)
+        plt.close()
+        
+        print("Benchmark comparison plot saved as 'strategy_benchmark_comparison.png'")
+        
+    except Exception as e:
+        print(f"Error in benchmark comparison: {str(e)}")
+
+# Main execution
+if __name__ == "__main__":
+    # Strategy parameters
+    params = {
+        'vol_threshold': 0.015, # Increased from 0.015 to 0.025 (2.5%)
+                                # Allows trading in higher volatility conditions
+                                # Will catch more volatile breakouts
+    
+        'stop_loss': 0.04,      # Increased from 0.02 to 0.03 (3%)
+                                # Gives trades more room to breathe
+                                # Reduces chances of getting stopped out in normal volatility
+    
+        'take_profit': 0.16,    # Increased from 0.04 to 0.06 (6%)
+                                # Looking for bigger moves
+                                # Better risk:reward ratio (1:2)
+    
+        'trail_percent': 0.05,  # Increased from 0.015 to 0.02 (2%)
+                                # Looser trailing stop
+                                # Lets winning trades run longer
+
+        'max_position_risk': 0.03   # Increased from 0.01 to 0.02 (2%)
+                                    # Larger position sizes
+                                    # More capital deployed per trade
+    }
+    
+    
+    # List of tickers
+    tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
+    
+    # Store all results
+    all_results = {}
+    
+    # Process each ticker
+    for ticker in tickers:
+        results = process_ticker(ticker, params)
+        if results:
+            all_results[ticker] = results
+    
+    # Print summary of all results
+    print("\nStrategy Summary Across All Stocks:")
+    print("=" * 50)
+    
+    if all_results:
+        avg_return = np.mean([r['Annual Return'] for r in all_results.values()])
+        avg_sharpe = np.mean([r['Sharpe Ratio'] for r in all_results.values()])
+        avg_drawdown = np.mean([r['Max Drawdown'] for r in all_results.values()])
+        
+        print(f"Average Annual Return: {avg_return:.2%}")
+        print(f"Average Sharpe Ratio: {avg_sharpe:.2f}")
+        print(f"Average Max Drawdown: {avg_drawdown:.2%}")
+    
+    # After processing all tickers, create benchmark comparison
+    if all_results:
+        plot_strategy_benchmark_comparison(all_results, tickers)
+
