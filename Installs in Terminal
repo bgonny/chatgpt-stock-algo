@@ -1,0 +1,5 @@
+
+#this allows us to install yfinance / pip / 
+
+py -m pip install yfinance
+
